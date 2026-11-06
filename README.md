@@ -10,12 +10,13 @@ Binary and reverse-engineering craft workstation.
 - `revecraft capa --file <path>`: Mandiant capa capability detection
 - `revecraft dki-decode --file <path>`: Decompress Directmedia .DKI files
 - `revecraft snapshot --file <path>`: Generate full static analysis snapshot
+- `revecraft extensions --action list|catalog|install|remove|enable|disable [--name ...]`: Manage Ghidra community extensions (SNES/65816-first catalog)
 - `revecraft mcp`: FastMCP stdio server
 
 ## Status — does today / next week / non-goals
 
-**Does today:** Python FastMCP workstation; 7 test fns; strings/entropy/PE/
-DiE/CAPA + DKI-decode + snapshot verbs.
+**Does today:** Python FastMCP workstation; 15 tests; strings/entropy/PE/
+DiE/CAPA + DKI-decode + snapshot + Ghidra-extensions verbs.
 
 **Next week:** engine-presence gates with `DOWN` receipts in tests; 3 recipes
 (strings-entropy, die-capa-smoke, dki-decode); frida confirm-gate in code +

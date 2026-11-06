@@ -6,7 +6,6 @@ import argparse
 import gzip
 import json
 import math
-import os
 import re
 import shutil
 import struct
@@ -15,6 +14,8 @@ import sys
 import zlib
 from pathlib import Path
 from typing import Any
+
+from . import ghidra_extensions as _gx
 
 ASCII_PRINTABLE = set(range(0x20, 0x7F)).union({0x09, 0x0A, 0x0D})
 
@@ -370,6 +371,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_snap.add_argument("--out-dir", type=Path, help="Output directory for snapshot JSON")
     p_snap.add_argument("--json", action="store_true", help="Output JSON")
 
+    # extensions (Ghidra community download + CRUD)
+    p_ext = sub.add_parser("extensions", help="Manage Ghidra community extensions")
+    p_ext.add_argument(
+        "--action",
+        required=True,
+        choices=["list", "catalog", "install", "remove", "enable", "disable"],
+        help="CRUD action",
+    )
+    p_ext.add_argument("--name", help="Catalog name, owner/repo, or https .zip URL")
+    p_ext.add_argument("--version", help="Release tag for install (default latest)")
+    p_ext.add_argument("--confirm", action="store_true", help="Required for remove")
+    p_ext.add_argument("--json", action="store_true", help="Output JSON")
+
     # mcp
     sub.add_parser("mcp", help="Run FastMCP stdio server")
 
@@ -457,6 +471,37 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Strings extracted: {res['strings_summary']['total_extracted']}")
                 if "saved_to" in res:
                     print(f"Saved to: {res['saved_to']}")
+            return 0
+
+        if args.verb == "extensions":
+            if args.action == "list":
+                res = _gx.list_installed()
+            elif args.action == "catalog":
+                res = _gx.catalog()
+            elif args.action == "install":
+                if not args.name:
+                    print("extensions install requires --name", file=sys.stderr)
+                    return 2
+                res = _gx.install_extension(args.name, version=args.version)
+            elif args.action == "remove":
+                if not args.name:
+                    print("extensions remove requires --name", file=sys.stderr)
+                    return 2
+                res = _gx.remove_extension(args.name, confirm=args.confirm)
+            elif args.action == "enable":
+                if not args.name:
+                    print("extensions enable requires --name", file=sys.stderr)
+                    return 2
+                res = _gx.set_enabled(args.name, True)
+            else:
+                if not args.name:
+                    print("extensions disable requires --name", file=sys.stderr)
+                    return 2
+                res = _gx.set_enabled(args.name, False)
+            if args.json:
+                print(json.dumps(res, indent=2))
+            else:
+                print(json.dumps(res, indent=2))
             return 0
 
         if args.verb == "mcp":
