@@ -1,0 +1,288 @@
+"""Ghidra community extensions: catalog + download/CRUD (revecraft port).
+
+Same curated catalog as reversing-mcp (SNES/65816-first) but dependency-free:
+plain urllib + shutil, no toolbox import. User Extensions dir:
+``%APPDATA%/ghidra/ghidra_*_PUBLIC/Extensions``.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import urllib.request
+import zipfile
+from pathlib import Path
+from typing import Any
+
+CATALOG: list[dict[str, Any]] = [
+    {
+        "name": "ghidra-65816",
+        "repo": "achan1989/ghidra-65816",
+        "kind": "processor",
+        "targets": ["SNES (Ricoh 5A22 / WDC 65c816)", "Apple IIgs"],
+        "description": "WDC 65816 processor module. Install FIRST (language 65816:LE:16:default).",
+        "asset_pattern": r".*\.zip$",
+        "install_kind": "github_release",
+    },
+    {
+        "name": "ghidra-snes-loader",
+        "repo": "Raikaru/ghidra-snes-loader",
+        "kind": "loader",
+        "targets": ["SNES LoROM/HiROM SMC/SFC"],
+        "description": "SNES ROM loader + DBR/DP tracker. Needs ghidra-65816. Modernised fork.",
+        "asset_pattern": r".*\.zip$",
+        "install_kind": "github_release",
+    },
+    {
+        "name": "ghidra-snes-loader-upstream",
+        "repo": "achan1989/ghidra-snes-loader",
+        "kind": "loader",
+        "targets": ["SNES LoROM/HiROM"],
+        "description": "Original SNES loader (archived upstream, provenance only).",
+        "asset_pattern": None,
+        "install_kind": "manual",
+    },
+    {
+        "name": "ghidra-snes-scripts",
+        "repo": "joshleaves/ghidra-snes",
+        "kind": "scripts",
+        "targets": ["SNES ROM scripts"],
+        "description": "Ghidra scripts for SNES ROM RE (clone into ghidra_scripts, not an Extension).",
+        "asset_pattern": None,
+        "install_kind": "manual",
+    },
+    {
+        "name": "ghidra-findcrypt",
+        "repo": "TorgoTorgo/ghidra-findcrypt",
+        "kind": "analyzer",
+        "targets": ["crypto constants"],
+        "description": "Auto-analysis module labelling crypto constants.",
+        "asset_pattern": r".*\.zip$",
+        "install_kind": "github_release",
+    },
+    {
+        "name": "Ghidrathon",
+        "repo": "cmu-sei/Ghidrathon",
+        "kind": "scripting",
+        "targets": ["Python 3 in Ghidra"],
+        "description": "CPython 3 interpreter for Ghidra (manual, version-pinned).",
+        "asset_pattern": None,
+        "install_kind": "manual",
+    },
+    {
+        "name": "BinExport",
+        "repo": "google/binexport",
+        "kind": "diffing",
+        "targets": ["BinDiff export"],
+        "description": "BinExport exporter (manual, version-pinned).",
+        "asset_pattern": None,
+        "install_kind": "manual",
+    },
+]
+
+_BY_NAME = {e["name"].lower(): e for e in CATALOG}
+
+
+def _user_roots() -> list[Path]:
+    roots: list[Path] = []
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        base = Path(appdata) / "ghidra"
+        if base.is_dir():
+            roots += sorted(base.glob("ghidra_*_PUBLIC"))
+    home = Path.home() / ".ghidra"
+    if home.is_dir():
+        roots += sorted(home.glob("ghidra_*_PUBLIC"))
+    return roots
+
+
+def user_extensions_dirs() -> list[Path]:
+    return [r / "Extensions" for r in _user_roots() if (r / "Extensions").is_dir()]
+
+
+def primary_dir(create: bool = False) -> Path | None:
+    dirs = user_extensions_dirs()
+    if dirs:
+        return max(dirs)
+    roots = _user_roots()
+    if not roots:
+        return None
+    ext = max(roots) / "Extensions"
+    if create:
+        ext.mkdir(parents=True, exist_ok=True)
+        return ext
+    return ext if ext.is_dir() else None
+
+
+def list_installed() -> dict[str, Any]:
+    items: list[dict[str, Any]] = []
+    searched: list[str] = []
+    for root in user_extensions_dirs():
+        searched.append(str(root))
+        for child in sorted(root.iterdir()):
+            if child.is_dir():
+                items.append(
+                    {
+                        "name": child.name,
+                        "path": str(child),
+                        "enabled": not child.name.endswith(".disabled"),
+                        "root": str(root),
+                    }
+                )
+    return {
+        "success": True,
+        "extensions": items,
+        "count": len(items),
+        "searched": searched,
+    }
+
+
+def catalog() -> dict[str, Any]:
+    installed = {
+        r.get("name", "").lower().removesuffix(".disabled"): r
+        for r in list_installed().get("extensions", [])
+    }
+    entries = []
+    for entry in CATALOG:
+        row = dict(entry)
+        hit = installed.get(entry["name"].lower())
+        row["installed"] = hit is not None
+        row["enabled"] = bool(hit and hit.get("enabled")) if hit else False
+        row["installed_path"] = hit.get("path") if hit else None
+        entries.append(row)
+    return {"success": True, "entries": entries, "count": len(entries)}
+
+
+def _github_asset(
+    repo: str, pattern: str | None, version: str | None = None
+) -> dict[str, Any]:
+    import re
+
+    api = f"https://api.github.com/repos/{repo}/releases/{'tags/' + version if version else 'latest'}"
+    try:
+        req = urllib.request.Request(
+            api,
+            headers={
+                "User-Agent": "revecraft",
+                "Accept": "application/vnd.github+json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            rel = json.loads(r.read().decode("utf-8", errors="replace"))
+        for a in rel.get("assets", []):
+            if pattern and re.search(pattern, a.get("name", ""), re.IGNORECASE):
+                return {
+                    "url": a["browser_download_url"],
+                    "name": a["name"],
+                    "tag": rel.get("tag_name"),
+                }
+        return {"error": f"no asset matching {pattern} in {repo} {version or 'latest'}"}
+    except Exception as e:
+        return {"error": f"GitHub API failed for {repo}: {e}"}
+
+
+def install_extension(name_or_url: str, version: str | None = None) -> dict[str, Any]:
+    dest_root = primary_dir(create=True)
+    if dest_root is None:
+        return {"success": False, "error": "No Ghidra user dir (start Ghidra once)."}
+    text = (name_or_url or "").strip()
+    url: str | None = None
+    name: str = text
+    if text.lower().startswith("https://") and text.lower().endswith(".zip"):
+        url = text
+        name = Path(text.split("?")[0].rstrip("/").split("/")[-1]).stem
+    else:
+        entry = _BY_NAME.get(text.lower())
+        if entry is None and "/" in text and " " not in text:
+            asset = _github_asset(text, r".*\.zip$", version)
+            if "error" in asset:
+                return {"success": False, "name": text, **asset}
+            url, name = asset["url"], text.split("/")[-1]
+        elif entry is None:
+            return {
+                "success": False,
+                "error": f"Unknown extension '{text}'. Known: {', '.join(sorted(_BY_NAME))}.",
+            }
+        elif entry.get("install_kind") != "github_release":
+            return {
+                "success": False,
+                "needs_manual": True,
+                "name": entry["name"],
+                "error": f"'{entry['name']}' is manual-install: https://github.com/{entry['repo']}.",
+            }
+        else:
+            asset = _github_asset(entry["repo"], entry["asset_pattern"], version)
+            if "error" in asset:
+                return {"success": False, "name": entry["name"], **asset}
+            url, name = asset["url"], entry["name"]
+    assert url is not None
+    tmp = Path(os.environ.get("TEMP", r"C:\Windows\Temp")) / f"revecraft-ext-{name}.zip"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "revecraft"})
+        with urllib.request.urlopen(req, timeout=900) as r, tmp.open("wb") as f:
+            shutil.copyfileobj(r, f, length=1024 * 256)
+    except Exception as e:
+        return {"success": False, "name": name, "error": f"download failed: {e}"}
+    dest = dest_root / name
+    try:
+        if dest.is_dir():
+            return {
+                "success": False,
+                "name": name,
+                "error": f"Already installed at {dest}.",
+            }
+        with zipfile.ZipFile(tmp) as z:
+            top = {p.split("/")[0] for p in z.namelist() if p.strip()}
+            sole = next(iter(top))
+            if len(top) == 1 and sole.lower() not in ("", "."):
+                z.extractall(dest_root)
+                extracted = dest_root / sole
+                if extracted != dest:
+                    shutil.move(str(extracted), str(dest))
+            else:
+                dest.mkdir(parents=True, exist_ok=True)
+                z.extractall(dest)
+        tmp.unlink(missing_ok=True)
+    except Exception as e:
+        return {"success": False, "name": name, "error": f"extract failed: {e}"}
+    return {
+        "success": True,
+        "name": name,
+        "path": str(dest),
+        "url": url,
+        "message": f"Installed '{name}'. Restart Ghidra.",
+    }
+
+
+def remove_extension(name: str, confirm: bool = False) -> dict[str, Any]:
+    if not confirm:
+        return {
+            "success": False,
+            "needs_confirm": True,
+            "error": f"Refusing to delete '{name}' without confirm=True.",
+        }
+    base = (name or "").strip().removesuffix(".disabled")
+    if not base or base in (".", "..") or "/" in base or "\\" in base:
+        return {"success": False, "error": f"Refusing odd extension name: {name!r}."}
+    for root in user_extensions_dirs():
+        for cand in (root / base, root / f"{base}.disabled"):
+            if cand.is_dir():
+                shutil.rmtree(cand)
+                return {"success": True, "name": base, "removed": str(cand)}
+    return {"success": False, "error": f"Extension '{name}' not found."}
+
+
+def set_enabled(name: str, enabled: bool = True) -> dict[str, Any]:
+    base = (name or "").strip().removesuffix(".disabled")
+    if not base or "/" in base or "\\" in base:
+        return {"success": False, "error": f"Refusing odd extension name: {name!r}."}
+    for root in user_extensions_dirs():
+        on, off = root / base, root / f"{base}.disabled"
+        src, dst = (off, on) if enabled else (on, off)
+        if src.is_dir() and not dst.exists():
+            src.rename(dst)
+            return {"success": True, "name": base, "enabled": enabled, "path": str(dst)}
+        if (on if enabled else off).is_dir():
+            return {"success": True, "name": base, "enabled": enabled}
+    return {"success": False, "error": f"Extension '{name}' not found."}

@@ -1,0 +1,476 @@
+"""ReveCraft CLI: Headless verbs for binary reverse-engineering and triage."""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import json
+import math
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import zlib
+from pathlib import Path
+from typing import Any
+
+from . import ghidra_extensions as _gx
+
+
+def extract_strings(file_path: Path, min_len: int = 4) -> list[dict[str, Any]]:
+    """Extract ASCII and UTF-16LE printable strings with byte offsets."""
+    if not file_path.is_file():
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    data = file_path.read_bytes()
+    results: list[dict[str, Any]] = []
+
+    # ASCII regex
+    ascii_pattern = re.compile(rb"[\x20-\x7e\t\r\n]{" + str(min_len).encode() + rb",}")
+    for match in ascii_pattern.finditer(data):
+        try:
+            s = match.group().decode("latin-1")
+            results.append({"offset": match.start(), "length": len(s), "string": s, "encoding": "ascii"})
+        except Exception:
+            pass
+
+    # UTF-16LE
+    utf16_pattern = re.compile(rb"(?:[\x20-\x7e\t\r\n]\x00){" + str(min_len).encode() + rb",}")
+    for match in utf16_pattern.finditer(data):
+        try:
+            s = match.group().decode("utf-16le")
+            results.append({"offset": match.start(), "length": len(s), "string": s, "encoding": "utf-16le"})
+        except Exception:
+            pass
+
+    results.sort(key=lambda x: x["offset"])
+    return results
+
+
+def calculate_entropy(file_path: Path, block_size: int = 256) -> dict[str, Any]:
+    """Calculate Shannon entropy for the file and block-by-block."""
+    if not file_path.is_file():
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    data = file_path.read_bytes()
+    if not data:
+        return {"overall": 0.0, "size": 0, "blocks": [], "compressed_regions": [], "random_regions": []}
+
+    def _entropy(chunk: bytes) -> float:
+        if not chunk:
+            return 0.0
+        counts = [0] * 256
+        for b in chunk:
+            counts[b] += 1
+        n = len(chunk)
+        ent = 0.0
+        for c in counts:
+            if c > 0:
+                p = c / n
+                ent -= p * math.log2(p)
+        return ent
+
+    overall = _entropy(data)
+    blocks: list[dict[str, Any]] = []
+    compressed: list[dict[str, Any]] = []
+    random: list[dict[str, Any]] = []
+
+    for i in range(0, len(data), block_size):
+        chunk = data[i : i + block_size]
+        ent = _entropy(chunk)
+        blocks.append({"offset": i, "size": len(chunk), "entropy": round(ent, 4)})
+        if ent < 3.0:
+            compressed.append({"offset": i, "entropy": round(ent, 4)})
+        elif ent > 7.5:
+            random.append({"offset": i, "entropy": round(ent, 4)})
+
+    return {
+        "file": str(file_path),
+        "size": len(data),
+        "overall": round(overall, 4),
+        "overall_entropy": round(overall, 4),
+        "block_size": block_size,
+        "blocks_count": len(blocks),
+        "compressed_regions": compressed,
+        "random_regions": random,
+    }
+
+
+def parse_pe_info(file_path: Path) -> dict[str, Any]:
+    """Parse PE headers, sections, and machine architecture."""
+    if not file_path.is_file():
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    data = file_path.read_bytes()
+    if len(data) < 64:
+        return {"valid_pe": False, "error": "File too small for PE header"}
+
+    if data[:2] != b"MZ":
+        return {"valid_pe": False, "error": "Missing MZ DOS header"}
+
+    pe_offset = struct.unpack("<I", data[60:64])[0]
+    if pe_offset + 24 > len(data):
+        return {"valid_pe": False, "error": "Corrupt PE offset beyond file bounds"}
+
+    if data[pe_offset : pe_offset + 4] != b"PE\x00\x00":
+        return {"valid_pe": False, "error": "Missing PE signature"}
+
+    machine = struct.unpack("<H", data[pe_offset + 4 : pe_offset + 6])[0]
+    num_sections = struct.unpack("<H", data[pe_offset + 6 : pe_offset + 8])[0]
+    timestamp = struct.unpack("<I", data[pe_offset + 8 : pe_offset + 12])[0]
+    opt_header_size = struct.unpack("<H", data[pe_offset + 20 : pe_offset + 22])[0]
+
+    machine_map = {0x014C: "Intel 386", 0x0200: "Intel Itanium", 0x8664: "AMD64", 0xAA64: "ARM64"}
+    machine_name = machine_map.get(machine, f"Unknown (0x{machine:04X})")
+
+    sections: list[dict[str, Any]] = []
+    section_start = pe_offset + 24 + opt_header_size
+    for s_idx in range(num_sections):
+        s_off = section_start + s_idx * 40
+        if s_off + 40 > len(data):
+            break
+        s_bytes = data[s_off : s_off + 40]
+        s_name = s_bytes[:8].rstrip(b"\x00").decode("latin-1", errors="replace")
+        v_size = struct.unpack("<I", s_bytes[8:12])[0]
+        v_addr = struct.unpack("<I", s_bytes[12:16])[0]
+        r_size = struct.unpack("<I", s_bytes[16:20])[0]
+        r_off = struct.unpack("<I", s_bytes[20:24])[0]
+        sections.append({
+            "name": s_name,
+            "virtual_size": v_size,
+            "virtual_address": hex(v_addr),
+            "raw_size": r_size,
+            "raw_offset": hex(r_off),
+        })
+
+    return {
+        "valid_pe": True,
+        "machine": machine_name,
+        "machine_code": hex(machine),
+        "num_sections": num_sections,
+        "timestamp": timestamp,
+        "pe_offset": hex(pe_offset),
+        "sections": sections,
+    }
+
+
+def run_die(file_path: Path) -> dict[str, Any]:
+    """Execute Detect It Easy (diec) if available, or report down."""
+    die_bin = shutil.which("diec") or shutil.which("diec.exe")
+    if not die_bin:
+        dev_tools = Path(r"D:\Dev\tools\die\diec.exe")
+        if dev_tools.is_file():
+            die_bin = str(dev_tools)
+
+    if not die_bin:
+        return {"status": "down", "available": False, "tool": "diec", "message": "diec not installed"}
+
+    try:
+        proc = subprocess.run([die_bin, "-j", str(file_path)], capture_output=True, text=True, timeout=30)
+        if proc.returncode == 0 and proc.stdout.strip():
+            try:
+                return {"status": "ok", "available": True, "output": json.loads(proc.stdout)}
+            except json.JSONDecodeError:
+                return {"status": "ok", "available": True, "output": proc.stdout.strip()}
+        return {"status": "error", "available": True, "stderr": proc.stderr}
+    except Exception as e:
+        return {"status": "error", "available": True, "error": str(e)}
+
+
+def run_capa(file_path: Path) -> dict[str, Any]:
+    """Execute Mandiant capa if available, or report down."""
+    capa_bin = shutil.which("capa") or shutil.which("capa.exe")
+    if not capa_bin:
+        dev_tools = Path(r"D:\Dev\tools\capa\capa.exe")
+        if dev_tools.is_file():
+            capa_bin = str(dev_tools)
+
+    if not capa_bin:
+        return {"status": "down", "available": False, "tool": "capa", "message": "capa not installed"}
+
+    try:
+        proc = subprocess.run([capa_bin, "-j", str(file_path)], capture_output=True, text=True, timeout=60)
+        if proc.returncode == 0 and proc.stdout.strip():
+            try:
+                return {"status": "ok", "available": True, "output": json.loads(proc.stdout)}
+            except json.JSONDecodeError:
+                return {"status": "ok", "available": True, "output": proc.stdout.strip()}
+        return {"status": "error", "available": True, "stderr": proc.stderr}
+    except Exception as e:
+        return {"status": "error", "available": True, "error": str(e)}
+
+
+def decode_dki(file_path: Path, out_path: Path | None = None) -> dict[str, Any]:
+    """Decode Directmedia .DKI file (zlib/gzip streams)."""
+    if not file_path.is_file():
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    data = file_path.read_bytes()
+    if not data:
+        return {"success": False, "error": "Empty file"}
+
+    # Attempt gzip
+    uncompressed: bytes | None = None
+    strategy = "none"
+
+    if data.startswith(b"\x1f\x8b"):
+        try:
+            uncompressed = gzip.decompress(data)
+            strategy = "gzip"
+        except Exception:
+            pass
+
+    # Attempt raw zlib / find zlib header
+    if uncompressed is None:
+        for offset in range(min(512, len(data))):
+            chunk = data[offset:]
+            if len(chunk) < 2:
+                continue
+            cmf, flg = chunk[0], chunk[1]
+            if ((cmf << 8) | flg) % 31 == 0 and (cmf & 0x0F) == 8:
+                try:
+                    uncompressed = zlib.decompress(chunk)
+                    strategy = f"zlib_offset_{offset}"
+                    break
+                except Exception:
+                    continue
+
+    # Attempt raw deflate
+    if uncompressed is None:
+        try:
+            uncompressed = zlib.decompress(data, -zlib.MAX_WBITS)
+            strategy = "raw_deflate"
+        except Exception:
+            pass
+
+    if uncompressed is None:
+        # Fallback: file might be plain text or uncompressed
+        uncompressed = data
+        strategy = "uncompressed_fallback"
+
+    # Decode text guess
+    text_preview = ""
+    encoding_guess = "utf-8"
+    for enc in ("utf-8", "cp1252", "latin-1"):
+        try:
+            decoded = uncompressed.decode(enc)
+            printable_ratio = sum(c.isprintable() or c in "\r\n\t" for c in decoded) / max(len(decoded), 1)
+            if printable_ratio > 0.8:
+                text_preview = decoded[:2000]
+                encoding_guess = enc
+                break
+        except Exception:
+            pass
+
+    if not text_preview:
+        text_preview = uncompressed[:2000].decode("latin-1", errors="replace")
+        encoding_guess = "latin-1"
+
+    if out_path:
+        out_path.write_bytes(uncompressed)
+
+    return {
+        "success": True,
+        "file": str(file_path),
+        "strategy": strategy,
+        "compressed_bytes": len(data),
+        "uncompressed_bytes": len(uncompressed),
+        "encoding": encoding_guess,
+        "preview": text_preview,
+        "out_file": str(out_path) if out_path else None,
+    }
+
+
+def create_snapshot(file_path: Path, out_dir: Path | None = None) -> dict[str, Any]:
+    """Generate comprehensive research snapshot combining strings, entropy, PE, and tool availability."""
+    if not file_path.is_file():
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    ent = calculate_entropy(file_path)
+    pe = parse_pe_info(file_path)
+    strings = extract_strings(file_path, min_len=4)
+    die_res = run_die(file_path)
+    capa_res = run_capa(file_path)
+
+    snapshot = {
+        "target": str(file_path),
+        "size_bytes": file_path.stat().st_size,
+        "entropy": {
+            "overall": ent["overall"],
+            "compressed_regions": len(ent["compressed_regions"]),
+            "random_regions": len(ent["random_regions"]),
+        },
+        "pe": pe,
+        "strings_summary": {
+            "total_extracted": len(strings),
+            "sample": strings[:50],
+        },
+        "engines": {
+            "die": die_res,
+            "capa": capa_res,
+        },
+    }
+
+    if out_dir:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        json_path = out_dir / f"{file_path.stem}_snapshot.json"
+        json_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+        snapshot["saved_to"] = str(json_path)
+
+    return snapshot
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="revecraft",
+        description="ReveCraft: Binary reverse-engineering workstation CLI",
+    )
+    parser.add_argument("--version", action="version", version="revecraft 0.1.0")
+
+    sub = parser.add_subparsers(dest="verb", required=True)
+
+    # strings
+    p_str = sub.add_parser("strings", help="Extract printable strings from binary")
+    p_str.add_argument("--file", required=True, type=Path, help="Input binary file")
+    p_str.add_argument("--min-len", type=int, default=4, help="Minimum string length")
+    p_str.add_argument("--json", action="store_true", help="Output JSON")
+
+    # entropy
+    p_ent = sub.add_parser("entropy", help="Calculate Shannon entropy")
+    p_ent.add_argument("--file", required=True, type=Path, help="Input binary file")
+    p_ent.add_argument("--block-size", type=int, default=256, help="Block size for mapping")
+    p_ent.add_argument("--json", action="store_true", help="Output JSON")
+
+    # pe-info
+    p_pe = sub.add_parser("pe-info", help="Parse Windows PE headers and sections")
+    p_pe.add_argument("--file", required=True, type=Path, help="Input PE file")
+    p_pe.add_argument("--json", action="store_true", help="Output JSON")
+
+    # die
+    p_die = sub.add_parser("die", help="Run Detect It Easy packer/compiler check")
+    p_die.add_argument("--file", required=True, type=Path, help="Input binary file")
+    p_die.add_argument("--json", action="store_true", help="Output JSON")
+
+    # capa
+    p_capa = sub.add_parser("capa", help="Run Mandiant capa capability analysis")
+    p_capa.add_argument("--file", required=True, type=Path, help="Input binary file")
+    p_capa.add_argument("--json", action="store_true", help="Output JSON")
+
+    # dki-decode
+    p_dki = sub.add_parser("dki-decode", help="Decompress Directmedia .DKI file")
+    p_dki.add_argument("--file", required=True, type=Path, help="Input .DKI file")
+    p_dki.add_argument("--out", type=Path, help="Output destination file")
+    p_dki.add_argument("--json", action="store_true", help="Output JSON")
+
+    # snapshot
+    p_snap = sub.add_parser("snapshot", help="Generate complete static triage snapshot")
+    p_snap.add_argument("--file", required=True, type=Path, help="Input binary file")
+    p_snap.add_argument("--out-dir", type=Path, help="Output directory for snapshot JSON")
+    p_snap.add_argument("--json", action="store_true", help="Output JSON")
+
+    # mcp
+    sub.add_parser("mcp", help="Run FastMCP stdio server")
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        if args.verb == "strings":
+            res = extract_strings(args.file, min_len=args.min_len)
+            if args.json:
+                print(json.dumps(res, indent=2))
+            else:
+                for s in res:
+                    print(f"0x{s['offset']:08X} [{s['encoding']}] {s['string']}")
+            return 0
+
+        if args.verb == "entropy":
+            res = calculate_entropy(args.file, block_size=args.block_size)
+            if args.json:
+                print(json.dumps(res, indent=2))
+            else:
+                print(f"File: {res['file']}")
+                print(f"Size: {res['size']} bytes")
+                print(f"Overall Entropy: {res['overall']:.4f}")
+                print(f"Blocks: {res['blocks_count']} (size {res['block_size']})")
+                print(f"Compressed Regions: {len(res['compressed_regions'])}")
+                print(f"Random/Encrypted Regions: {len(res['random_regions'])}")
+            return 0
+
+        if args.verb == "pe-info":
+            res = parse_pe_info(args.file)
+            if args.json:
+                print(json.dumps(res, indent=2))
+            else:
+                if not res.get("valid_pe"):
+                    print(f"Invalid PE: {res.get('error')}", file=sys.stderr)
+                    return 1
+                print(f"Architecture: {res['machine']}")
+                print(f"Sections: {res['num_sections']}")
+                for sec in res.get("sections", []):
+                    print(f"  {sec['name']:<8} Raw: {sec['raw_size']:<8} Virt: {sec['virtual_size']}")
+            return 0
+
+        if args.verb == "die":
+            res = run_die(args.file)
+            if args.json:
+                print(json.dumps(res, indent=2))
+            else:
+                print(json.dumps(res, indent=2))
+            return 0
+
+        if args.verb == "capa":
+            res = run_capa(args.file)
+            if args.json:
+                print(json.dumps(res, indent=2))
+            else:
+                print(json.dumps(res, indent=2))
+            return 0
+
+        if args.verb == "dki-decode":
+            res = decode_dki(args.file, out_path=args.out)
+            if args.json:
+                print(json.dumps(res, indent=2))
+            else:
+                print(f"DKI Strategy: {res['strategy']}")
+                print(f"Compressed: {res['compressed_bytes']} bytes -> Uncompressed: {res['uncompressed_bytes']} bytes")
+                print(f"Guessed Encoding: {res['encoding']}")
+                print("--- Preview ---")
+                print(res["preview"][:300])
+            return 0
+
+        if args.verb == "snapshot":
+            res = create_snapshot(args.file, out_dir=args.out_dir)
+            if args.json:
+                print(json.dumps(res, indent=2))
+            else:
+                print(f"Snapshot generated for: {res['target']}")
+                print(f"Size: {res['size_bytes']} bytes")
+                print(f"Entropy: {res['entropy']['overall']:.4f}")
+                print(f"PE valid: {res['pe'].get('valid_pe')}")
+                print(f"Strings extracted: {res['strings_summary']['total_extracted']}")
+                if "saved_to" in res:
+                    print(f"Saved to: {res['saved_to']}")
+            return 0
+
+        if args.verb == "mcp":
+            from .mcp_server import mcp
+
+            mcp.run()
+            return 0
+
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

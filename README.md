@@ -10,6 +10,7 @@ Binary and reverse-engineering craft workstation.
 - `revecraft capa --file <path>`: Mandiant capa capability detection
 - `revecraft dki-decode --file <path>`: Decompress Directmedia .DKI files
 - `revecraft snapshot --file <path>`: Generate full static analysis snapshot
+- `revecraft extensions --action list|catalog|install|remove|enable|disable [--name ...]`: Manage Ghidra community extensions (SNES/65816-first catalog)
 - `revecraft mcp`: FastMCP stdio server
 
 ## Status — does today / next week / non-goals
